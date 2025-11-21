@@ -856,30 +856,71 @@ jobs:
         run: |
           echo "Logs: ${{ steps.prepare-matrix.outputs.logs_url }}"
 
-      - name: Get server list from NetBox
+      - name: Generate server lists from NetBox (JSON)
         id: prepare-urls
         run: |
 
+          set -euo pipefail
+
+          mkdir -p build/output/info
+
+          # copy traskers list
           cp trackerslist/best.txt build/output/info/best-torrent-servers.txt
 
-          timeout 10 curl -s -H "Authorization: Token ${{ secrets.NETBOX_TOKEN }}" -H \
-          "Accept: application/json; indent=4" "${{ secrets.NETBOX_API }}/virtualization/virtual-machines/?limit=500&name__empty=false&device_role=Mirror&tag=images&status=active" \
-          | jq '.results[] | .name' | grep -v null | sed "s/\"//g" > build/output/info/servers.csv
+          BASE_URL="${{ secrets.NETBOX_API }}/virtualization/virtual-machines/?limit=500&name__empty=false&status=active"
 
-          timeout 10 curl -s -H "Authorization: Token ${{ secrets.NETBOX_TOKEN }}" -H \
-          "Accept: application/json; indent=4" "${{ secrets.NETBOX_API }}/virtualization/virtual-machines/?limit=500&name__empty=false&device_role=Mirror&tag=images&status=active" \
-          | jq '.results[] | .name, .custom_fields["download_path_images"]' | sed "s/\"//g" | sed "s|null|dl|" | sed "s/\"//g" | xargs -n2 -d'\n' | sed "s/ /\//g" \
-          | jq -cnR '[inputs | select(length>0)]' | jq -c '.[]' | sed "s/\"//g" | sort -R > build/output/info/servers-download.csv
+          for kind in servers servers-download servers-cache servers-upload; do
+            case "$kind" in
+              servers)
+                # Mirrors serving images, path from download_path_images, default "dl"
+                url="$BASE_URL&device_role=Mirror&tag=images"
+                path_field="download_path_images"
+                default_path="dl"
+                outfile="build/output/info/servers.jq"
+                ;;
+              servers-download)
+                # Same as servers, but separate list (if you want different routing later)
+                url="$BASE_URL&device_role=Mirror&tag=images"
+                path_field="download_path_images"
+                default_path="dl"
+                outfile="build/output/info/servers-download.jq"
+                ;;
+              servers-cache)
+                # Cache mirrors, path from download_path_images, default "cache"
+                url="$BASE_URL&device_role=Mirror&tag=cache"
+                path_field="download_path_images"
+                default_path="cache"
+                outfile="build/output/info/servers-cache.jq"
+                ;;
+              servers-upload)
+                # Upload targets, path from custom_fields.path, default "beta"
+                url="$BASE_URL&tag=upload&tag=images"
+                path_field="path"
+                default_path="beta"
+                outfile="build/output/info/servers-upload.jq"
+                ;;
+            esac
 
-          timeout 10 curl -s -H "Authorization: Token ${{ secrets.NETBOX_TOKEN }}" -H \
-          "Accept: application/json; indent=4" "${{ secrets.NETBOX_API }}/virtualization/virtual-machines/?limit=500&name__empty=false&device_role=Mirror&tag=cache&status=active" \
-          | jq '.results[] | .name, .custom_fields["download_path_images"]' | sed "s/\"//g" | sed "s|null|cache|" | sed "s/\"//g" | xargs -n2 -d'\n' | sed "s/ /\//g" \
-          | jq -cnR '[inputs | select(length>0)]' | jq -c '.[]' | sed "s/\"//g" | sort -R > build/output/info/servers-cache.csv
+            echo "Generating $outfile from $url"
 
-          timeout 10 curl -s -H "Authorization: Token ${{ secrets.NETBOX_TOKEN }}" -H "Accept: application/json; indent=4" \
-          "${{ secrets.NETBOX_API }}/virtualization/virtual-machines/?limit=500&name__empty=false&tag=upload&tag=images&status=active" \
-          | jq '.results[] | .name,.custom_fields["path"],.custom_fields["port"],.custom_fields["username"]' | sed "s|null|beta|" | sed "s/\"//g" | xargs -n4 -d'\n' \
-          | sed "s/ /,/g" | jq -cnR '[inputs | select(length>0)]' | jq -c '.[]' | sed "s/\"//g" | sort -R > build/output/info/servers-upload.csv
+            timeout 10 curl -s \
+              -H "Authorization: Token ${{ secrets.NETBOX_TOKEN }}" \
+              -H "Accept: application/json; indent=4" \
+              "$url" \
+            | jq --arg pathField "$path_field" --arg defaultPath "$default_path" '
+                .results
+                | map(
+                    select(.name != null)
+                    | {
+                        host: .name,
+                        path: (.custom_fields[$pathField] // $defaultPath),
+                        port: (.custom_fields["port"] // 22),
+                        username: (.custom_fields["username"] // "mirror")
+                      }
+                  )
+                | sort_by(.host)
+              ' > "$outfile"
+          done
 
       # Store output/info folder in a GitHub Actions artifact
       - uses: actions/upload-artifact@v5
@@ -2260,56 +2301,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -2318,7 +2396,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -2330,18 +2408,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -2393,7 +2484,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -2405,14 +2496,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -2554,56 +2645,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -2612,7 +2740,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -2624,18 +2752,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -2687,7 +2828,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -2699,14 +2840,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -2848,56 +2989,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -2906,7 +3084,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -2918,18 +3096,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -2981,7 +3172,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -2993,14 +3184,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -3142,56 +3333,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -3200,7 +3428,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -3212,18 +3440,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -3275,7 +3516,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -3287,14 +3528,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -3436,56 +3677,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -3494,7 +3772,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -3506,18 +3784,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -3569,7 +3860,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -3581,14 +3872,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -3730,56 +4021,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -3788,7 +4116,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -3800,18 +4128,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -3863,7 +4204,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -3875,14 +4216,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -4024,56 +4365,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -4082,7 +4460,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -4094,18 +4472,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -4157,7 +4548,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -4169,14 +4560,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -4318,56 +4709,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -4376,7 +4804,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -4388,18 +4816,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -4451,7 +4892,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -4463,14 +4904,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -4612,56 +5053,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -4670,7 +5148,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -4682,18 +5160,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -4745,7 +5236,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -4757,14 +5248,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -4906,56 +5397,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -4964,7 +5492,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -4976,18 +5504,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -5039,7 +5580,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -5051,14 +5592,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -5200,56 +5741,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -5258,7 +5836,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -5270,18 +5848,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -5333,7 +5924,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -5345,14 +5936,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -5494,56 +6085,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -5552,7 +6180,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -5564,18 +6192,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -5627,7 +6268,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -5639,14 +6280,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -5788,56 +6429,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -5846,7 +6524,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -5858,18 +6536,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -5921,7 +6612,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -5933,14 +6624,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -6082,56 +6773,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -6140,7 +6868,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -6152,18 +6880,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -6215,7 +6956,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -6227,14 +6968,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -6376,56 +7117,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -6434,7 +7212,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -6446,18 +7224,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -6509,7 +7300,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -6521,14 +7312,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
@@ -6670,56 +7461,93 @@ jobs:
         timeout-minutes: 3
         run: |
 
-          ls -la output/info/
+          # Build tracker list (unchanged in spirit, just cleaner)
+          TRACKERS=$(
+            grep -v '^[ 	]*$' output/info/best-torrent-servers.txt \
+              | sort -R \
+              | sed 's/^/ --announce=/'
+          )
 
-          TRACKERS=$(cat output/info/best-torrent-servers.txt | sed '/^\s*$/d' | sort -R | while read line; do printf " --announce=""${line}"; done)
-          for files in zip xz qcow2; do
-            if ls -l output/images/*/archive/*.$files &>/dev/null; then
-              BOARD=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f3 | rev)
-              FILE=$(ls -1 output/images/*/archive/*.$files | rev | cut -d"/" -f1 | rev)
+          # Find BOARD and FILE (zip/xz/qcow2), same logic as before
+          BOARD=""
+          FILE=""
+
+          for ext in zip xz qcow2; do
+            if ls output/images/*/archive/*."$ext" >/dev/null 2>&1; then
+              first_match=$(ls -1 output/images/*/archive/*."$ext" | head -n1)
+              BOARD=$(basename "$(dirname "$first_match")")   # .../BOARD/archive/file.ext
+              FILE=$(basename "$first_match")
+              break
             fi
           done
-          # nighly images are GH only
-          rm -f servers.txt
-          if [ "${{ github.event.inputs.nightlybuild || 'yes' }}" == "no" ]; then
-             WEBSEEDS=$(for server in $(cat output/info/servers-download.csv)
-             do
-                 echo "http://$server/$SERVER_PATH" | sed "s|$|${BOARD}\/archive\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS=$(echo $WEBSEEDS | sed 's/,*$//g' | sed 's/ //g')
-          else
-             WEBSEEDS=$(for server in $(cat output/info/servers-cache.csv)
-             do
-                 echo -n "http://$server/$SERVER_PATH" | sed "s|$|community\/${{ needs.matrix_prep.outputs.version }}\/${FILE},|"
-             done | sed 's/ \+/\n/g')
-             WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+
+          # Safety check (optional)
+          if [ -z "$BOARD" ] || [ -z "$FILE" ]; then
+            echo "No torrent source file found (zip/xz/qcow2) in output/images/*/archive" >&2
+            exit 1
           fi
-          cd output/images/*/archive/
-          mktorrent --comment="Armbian torrent for ${FILE}" --verbose ${TRACKERS} --web-seed="${WEBSEEDS}" ${FILE}
+
+          nightlybuild="${{ github.event.inputs.nightlybuild }}"
+          nightlybuild_default="'yes'"
+          effective_nightlybuild="${nightlybuild:-$nightlybuild_default}"
+
+          # We'll produce a comma-separated list of webseeds
+          WEBSEEDS=""
+
+          if [ "$effective_nightlybuild" = "no" ]; then
+            # Stable releases → use download mirrors (servers-download.jq)
+            # SERVER_PATH assumed to be defined elsewhere in your script/env
+            WEBSEEDS=$(
+              jq -r --arg sp "$SERVER_PATH" --arg board "$BOARD" --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($sp)\($board)/archive/\($file)"
+              ' output/info/servers-download.jq | paste -sd, -
+            )
+          else
+            # Nightly → use cache mirrors (servers-cache.jq) + GitHub as extra webseed
+            WEBSEEDS=$(
+              jq -r --arg repo "community" \
+                    --arg ver "${{ needs.matrix_prep.outputs.version }}" \
+                    --arg file "$FILE" '
+                .[] | "http://\(.host)\(.path)/\($repo)/\($ver)/\($file)"
+              ' output/info/servers-cache.jq | paste -sd, -
+            )
+
+            # Append GitHub webseed
+            if [ -n "$WEBSEEDS" ]; then
+              WEBSEEDS+=","
+            fi
+            WEBSEEDS+="https://github.com/armbian/community/releases/download/${{ needs.matrix_prep.outputs.version }}/${FILE}"
+          fi
+
+          # Now build the torrent
+          cd output/images/*/archive/ || exit 1
+
+          mktorrent \
+            --comment="Armbian torrent for ${FILE}" \
+            --verbose \
+            ${TRACKERS} \
+            --web-seed="${WEBSEEDS}" \
+            "${FILE}"
 
           # drop .txt file
           rm -f *.txt
 
-      #- name: Choose random user for upload
-      #  run: |
-
-          #arr[0]="${{ secrets.ACCESS_TOKEN }}"
-          #arr[1]="${{ secrets.ACCESS_TOKEN_ARMBIANWORKER }}"
-          #rand=$[ $RANDOM % 2 ]
-          #echo "upload_user=${arr[$rand]}" >> $GITHUB_ENV
-
-      - name: Prepare release artifacts (exclude .asc, .sha, .torrent)
+      - name: "Prepare release artifacts (exclude .asc, .sha, .torrent)"
         run: |
           # Start from a clean directory
           rm -rf output/release
           mkdir -p output/release
 
-          # Copy wanted artifacts only
+          # Copy wanted artifacts from output/images, preserving folder structure
+          # e.g. output/images/BOARDNAME/archive/Armbian_*.img -> output/release/output/images/BOARDNAME/archive/...
           find output/images -type f -name 'Armbian_*.*' \
             ! -name '*.asc' \
             ! -name '*.sha' \
             ! -name '*.torrent' \
-            -exec cp {} output/release/ \;
+            -exec cp --parents {} output/release/ \;
+
+          # debug
+          ls -l output/release/ 
 
       - name: "Upload artefacts except .asc, .sha and .torrent"
         timeout-minutes: 60
@@ -6728,7 +7556,7 @@ jobs:
         with:
           repo: "${{ env.RELEASE_REPOSITORY }}"
           tag: "${{ needs.matrix_prep.outputs.version }}"
-          artifacts: "output/release/*"
+          artifacts: "output/release/output/images/*/*/Armbian_*.*"
           omitBody: true
           replacesArtifacts: true
           omitName: true
@@ -6740,18 +7568,31 @@ jobs:
 
       - name: "Upload to servers"
         run: |
+
+          # debug
+          echo "=== servers-cache.jq ==="
+          jq . output/info/servers-cache.jq || cat output/info/servers-cache.jq
+          echo "=== servers-upload.jq ==="
+          jq . output/info/servers-upload.jq || cat output/info/servers-upload.jq
+
           max_retries=3
 
-          sync_from_csv() {
-              local csv=$1
+          sync_from_json() {
+              local json_file=$1
               local mode=$2          # "cache" or "upload"
 
-              echo "== Processing ${csv} (mode: ${mode}) =="
+              echo "== Processing ${json_file} (mode: ${mode}) =="
 
-              while IFS=, read -r SERVER_URL SERVER_PATH SERVER_PORT SERVER_USERNAME _; do
-                  # skip empty / commented
+              # Iterate over JSON array elements
+              while IFS= read -r server; do
+                  # Extract fields with jq
+                  SERVER_URL=$(jq -r '.host // empty' <<<"$server")
+                  SERVER_PATH=$(jq -r '.path // ""' <<<"$server")
+                  SERVER_PORT=$(jq -r '.port // 22' <<<"$server")
+                  SERVER_USERNAME=$(jq -r '.username // "mirror"' <<<"$server")
+
+                  # skip empty host
                   [ -z "$SERVER_URL" ] && continue
-                  case "$SERVER_URL" in \#*) continue ;; esac
 
                   echo "Processing: $SERVER_URL:$SERVER_PORT (path: $SERVER_PATH)"
 
@@ -6803,7 +7644,7 @@ jobs:
                       sleep 10
                   done
 
-              done < "$csv"
+              done < <(jq -c '.[]' "$json_file")
           }
 
           nightlybuild="${{ github.event.inputs.nightlybuild }}"
@@ -6815,14 +7656,14 @@ jobs:
           if [ "$effective_nightlybuild" = "yes" ] || \
             [ "$RELEASE_REPOSITORY" = "community" ] || \
             [ "$RELEASE_REPOSITORY" = "distribution" ]; then
-            # Upload to cache servers: only .xz/.sha/.torrent
-            sync_from_csv output/info/servers-cache.csv cache
+              # Upload to cache servers: only .xz/.sha/.torrent
+              sync_from_json output/info/servers-cache.jq cache
           fi
 
           if [ "$effective_nightlybuild" = "no" ] && \
             [ "$RELEASE_REPOSITORY" = "os" ]; then
-            # Upload to servers: everything except .xz/.sha/.torrent
-            sync_from_csv output/info/servers-upload.csv upload
+              # Upload to servers: everything except .xz/.sha/.torrent
+              sync_from_json output/info/servers-upload.jq upload
           fi
 
       # cleaning self hosted runners
